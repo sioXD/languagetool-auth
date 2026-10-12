@@ -1,0 +1,29 @@
+services:
+  languagetool:
+    image: erikvl87/languagetool:latest
+    container_name: languagetool
+    restart: unless-stopped
+    environment:
+      Java_Xms: 512m          # Start-Heap
+      Java_Xmx: 2g            # Max. Heap – anpassen, wenn der PC wenig RAM hat (z. B. 1g)
+    networks:
+      - lan
+    # Bewusst KEIN ports-Eintrag:
+    # LanguageTool ist nur über nginx (Basic Auth) erreichbar.
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: languagetool-nginx
+    restart: unless-stopped
+    depends_on:
+      - languagetool
+    ports:
+      - "${PUBLIC_PORT:-8082}:8082"   # öffentlicher Port (für Portfreigabe)
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/.htpasswd:/etc/nginx/.htpasswd:ro
+    networks:
+      - lan
+
+networks:
+  lan:
