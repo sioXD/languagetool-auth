@@ -1,14 +1,26 @@
 #!/usr/bin/env bash
 #
-# Setup für LanguageTool + nginx Basic Auth
-# - erzeugt die .env aus der Vorlage (falls nötig)
-# - erzeugt die htpasswd-Datei für ALLE Benutzer aus LT_USERS in .env
+# Setup für LanguageTool hinter nginx mit geheimem Pfad
+# - erzeugt nginx/secret.conf mit einem zufälligen geheimen Pfad (Hash)
+# - lädt optional n-gram-Daten
 # - startet die Container
+# - gibt den fertigen Link für die Browser-Extension aus
+#
+# Es wird KEINE .env-Datei mehr benötigt.
 #
 set -euo pipefail
 cd "$(dirname "$0")"
 
-PASSWD_FILE="nginx/.htpasswd"
+# ======================= Konfiguration =======================
+# Öffentlicher Port, unter dem LanguageTool erreichbar ist.
+# Bei Änderung nur hier anpassen. docker-compose.yml übernimmt den Wert
+# automatisch; nginx lauscht intern weiterhin auf 8082.
+PUBLIC_PORT=8082
+# =============================================================
+
+export PUBLIC_PORT
+
+SECRET_CONF="nginx/secret.conf"
 
 # ---------- Hilfsfunktionen ----------
 trim() {
@@ -18,24 +30,12 @@ trim() {
     printf '%s' "$s"
 }
 
-# Erzeugt eine htpasswd-Zeile "benutzer:hash" (bevorzugt bcrypt)
-hash_entry() {
-    local user="$1" pass="$2"
-    if command -v htpasswd >/dev/null 2>&1; then
-        htpasswd -nbB "$user" "$pass"
-    elif command -v openssl >/dev/null 2>&1; then
-        local h
-        h="$(printf '%s' "$pass" | openssl passwd -apr1 -stdin)"
-        printf '%s:%s\n' "$user" "$h"
-    else
-        docker run --rm httpd:2.4-alpine htpasswd -nbB "$user" "$pass"
-    fi
-}
-
 # ---------- n-gram-Daten (Language Model, optional) ----------
 # Quellen: feste Download-Dateinamen von https://languagetool.org/download/ngram-data/
 NGRAM_BASE_URL="https://languagetool.org/download/ngram-data"
 NGRAM_DIR="ngrams"
+# Merkt sich die Auswahl (z. B. "de,en"). Leere Datei = bewusst "Keine".
+NGRAM_STATE="$NGRAM_DIR/.languages"
 
 # Liefert den ZIP-Dateinamen für eine Sprache oder scheitert bei unbekannter Sprache.
 ngram_zip() {
@@ -135,13 +135,37 @@ ensure_ngram_dir_ready() {
     return 0
 }
 
+# Entpackt ein ZIP. unzip ist nicht überall vorhanden (z. B. NixOS),
+# deshalb Fallbacks auf bsdtar und python3.
+extract_zip() {
+    local zip="$1" dest="$2"
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -q "$zip" -d "$dest"
+    elif command -v bsdtar >/dev/null 2>&1; then
+        mkdir -p "$dest"
+        bsdtar -xf "$zip" -C "$dest"
+    elif command -v python3 >/dev/null 2>&1; then
+        mkdir -p "$dest"
+        python3 -m zipfile -e "$zip" "$dest"
+    else
+        return 1
+    fi
+}
+
 # Lädt fehlende Sprachen herunter und entpackt sie. Vorhandene werden übersprungen.
 ensure_ngrams() {
     local langs="$1"
     [ -z "$langs" ] && return 0
 
-    if ! command -v curl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
-        echo "Warnung: 'curl' und/oder 'unzip' fehlen – n-gram-Daten werden übersprungen." >&2
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "Warnung: 'curl' fehlt – n-gram-Daten werden übersprungen." >&2
+        return 0
+    fi
+    if ! command -v unzip >/dev/null 2>&1 \
+        && ! command -v bsdtar >/dev/null 2>&1 \
+        && ! command -v python3 >/dev/null 2>&1; then
+        echo "Warnung: kein Entpacker gefunden (unzip, bsdtar oder python3)" >&2
+        echo "         – n-gram-Daten werden übersprungen." >&2
         return 0
     fi
 
@@ -169,7 +193,7 @@ ensure_ngrams() {
             rm -rf "$tmp"
             continue
         fi
-        if ! unzip -q "$tmp/$zip" -d "$tmp/x"; then
+        if ! extract_zip "$tmp/$zip" "$tmp/x"; then
             echo "    Fehler: Entpacken fehlgeschlagen – $lang wird übersprungen." >&2
             rm -rf "$tmp"
             continue
@@ -193,25 +217,37 @@ gen_token() {
     fi
 }
 
-# Setzt/ersetzt KEY="WERT" in .env (legt vorher ein Backup .env.bak an).
-set_env_var() {
-    local key="$1" val="$2" tmp
-    cp -f .env .env.bak
-    chmod 600 .env.bak 2>/dev/null || true
-    tmp="$(mktemp)"
-    awk -v key="$key" -v val="$val" '
-        BEGIN { done = 0 }
-        $0 ~ "^[[:space:]]*(export[[:space:]]+)?" key "=" { print key "=\"" val "\""; done = 1; next }
-        { print }
-        END { if (!done) print key "=\"" val "\"" }
-    ' .env > "$tmp"
-    mv "$tmp" .env
+# Speichert die n-gram-Auswahl (ohne .env).
+save_ngrams_to_state() {
+    mkdir -p "$NGRAM_DIR"
+    printf '%s\n' "$1" > "$NGRAM_STATE"
+    echo "  (Auswahl gespeichert${1:+, aktuell: $1})"
 }
 
-# Speichert die n-gram-Auswahl in .env.
-save_ngrams_to_env() {
-    set_env_var LT_NGRAMS "$1"
-    echo "  (Auswahl in .env gespeichert${1:+, aktuell: $1})"
+# ---------- Geheimer Pfad (Hash) ----------
+# Liest den aktuell verwendeten geheimen Pfad aus nginx/secret.conf.
+read_secret() {
+    [ -f "$SECRET_CONF" ] || return 0
+    sed -n 's|^location /\([^/]*\)/ {|\1|p' "$SECRET_CONF" | head -n1
+}
+
+# Schreibt nginx/secret.conf mit dem übergebenen geheimen Pfad.
+write_secret_conf() {
+    local secret="$1"
+    mkdir -p nginx
+    cat > "$SECRET_CONF" <<EOF
+# Automatisch erzeugt von setup.sh – nicht manuell bearbeiten.
+# LanguageTool ist ausschließlich über diesen geheimen Pfad erreichbar.
+location /${secret}/ {
+    limit_req zone=lt burst=20 nodelay;
+    proxy_pass http://languagetool:8010/;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+}
+EOF
+    chmod 600 "$SECRET_CONF" 2>/dev/null || true
 }
 
 # ---------- Server-Adresse für die LanguageTool-Extension ----------
@@ -236,164 +272,95 @@ detect_public_ip() {
     printf '%s' "$ip"
 }
 
-# Gibt die fertige Server-Adresse für die Extension und für Programme aus.
-print_extension_hint() {
-    local user="$1" pass="$2" port="$3" secret="$4"
+# Gibt den fertigen Link für die Extension aus.
+print_link() {
+    local secret="$1"
     local lan_ip pub_ip
     lan_ip="$(detect_lan_ip)"
     pub_ip="$(detect_public_ip)"
 
     echo
     echo "============================================================"
-    echo " Server-Adresse für die LanguageTool-Extension"
+    echo " LanguageTool-Adresse für die Browser-Extension"
     echo "============================================================"
     echo
-    echo "WICHTIG: Die Extension kann KEIN Passwort senden."
-    echo "  -> auf diesem PC / im LAN: normale URL OHNE Passwort"
-    if [ -n "$secret" ]; then
-        echo "  -> aus dem Internet:       der geheime Pfad /${secret}/ (statt Passwort)"
-    fi
+    echo "Diese URL im Feld 'Server-URL' bzw. 'LanguageTool API Server URL'"
+    echo "eintragen ('/v2' am Ende gehört dazu):"
     echo
-    echo "Eine davon in der Extension eintragen"
-    echo "(Felder 'Server-URL' bzw. 'LanguageTool API Server URL'):"
-    echo
-    echo "  auf diesem PC:      http://localhost:${port}/v2"
+    echo "  auf diesem PC:      http://localhost:${PUBLIC_PORT}/${secret}/v2"
     if [ -n "$lan_ip" ]; then
-        echo "  im Heimnetz (LAN):  http://${lan_ip}:${port}/v2"
+        echo "  im Heimnetz (LAN):  http://${lan_ip}:${PUBLIC_PORT}/${secret}/v2"
     fi
-    if [ -n "$secret" ]; then
-        if [ -n "$pub_ip" ]; then
-            echo "  aus dem Internet:   http://${pub_ip}:${port}/${secret}/v2"
-        else
-            echo "  aus dem Internet:   http://DEINE-DDNS-ODER-IP:${port}/${secret}/v2"
-        fi
-    fi
-    echo
-    echo "Für andere Programme (curl, Skripte, Apps) MIT Passwort:"
     if [ -n "$pub_ip" ]; then
-        echo "  http://${user}:${pass}@${pub_ip}:${port}/v2"
-    fi
-    if [ -n "$lan_ip" ]; then
-        echo "  http://${user}:${pass}@${lan_ip}:${port}/v2"
-    fi
-    if [ -z "$lan_ip" ] && [ -z "$pub_ip" ]; then
-        echo "  http://${user}:${pass}@HOST:${port}/v2"
+        echo "  aus dem Internet:   http://${pub_ip}:${PUBLIC_PORT}/${secret}/v2"
+    else
+        echo "  aus dem Internet:   http://DEINE-DDNS-ODER-IP:${PUBLIC_PORT}/${secret}/v2"
     fi
     echo
-    echo "  Wichtig: das '/v2' am Ende gehört dazu."
-    case "$pass" in
-        *[@:/%,]*|*" "*)
-            echo "  ACHTUNG: Das Passwort enthält Sonderzeichen (@ : / % , Leerzeichen)"
-            echo "  – in der URL prozent-encodieren (z. B. '@' -> %40) oder einfacheres wählen."
-            ;;
-    esac
-    if [ -n "$secret" ]; then
-        echo "  Der geheime Pfad ist ein Ersatz für das Passwort bei der Extension:"
-        echo "  wie ein Passwort behandeln, über 'LT_SECRET' in .env änderbar."
-    fi
-    echo "  Hinweis: Chrome/Edge blockieren 'benutzer:passwort@...' – nutze Firefox."
+    echo "  Der geheime Pfad ist wie ein Passwort: nicht weitergeben."
+    echo "  Ein neuer Link lässt sich jederzeit mit ./setup.sh erzeugen."
 }
 
-# ---------- 1. .env sicherstellen ----------
-if [ ! -f .env ]; then
-    if [ -f .env.example ]; then
-        cp .env.example .env
-        echo
-        echo "Es wurde eine neue Datei '.env' erstellt."
-        echo "  -> Bitte öffne '.env' und trage deine Benutzer in LT_USERS ein."
-        echo "  -> Dann dieses Skript erneut ausführen:  ./setup.sh"
-        echo
-        exit 1
-    else
-        echo "Fehler: Weder .env noch .env.example vorhanden." >&2
-        exit 1
-    fi
-fi
+# ---------- 1. Menü: letzten Link ausgeben oder neuen erstellen ----------
+existing_secret="$(read_secret)"
 
-set -a
-# shellcheck disable=SC1091
-source .env
-set +a
-
-# Abwärtskompatibilität: LT_USER/LT_PASS weiterhin erlaubt
-if [ -z "${LT_USERS:-}" ] && [ -n "${LT_USER:-}" ] && [ -n "${LT_PASS:-}" ]; then
-    LT_USERS="${LT_USER}:${LT_PASS}"
-fi
-
-if [ -z "${LT_USERS:-}" ]; then
-    echo "Fehler: LT_USERS ist in .env nicht gesetzt." >&2
-    echo "Format: LT_USERS=\"benutzer1:passwort1,benutzer2:passwort2\"" >&2
-    exit 1
-fi
-
-# ---------- 2. htpasswd-Datei für alle Benutzer erzeugen ----------
-mkdir -p nginx
-
-TMP_HTPASSWD="$(mktemp)"
-trap 'rm -f "$TMP_HTPASSWD"' EXIT
-
-echo "Erzeuge Basic-Auth-Datei für folgende Benutzer:"
-count=0
-first_user=""
-first_pass=""
-IFS=',' read -ra _entries <<< "$LT_USERS"
-for entry in "${_entries[@]}"; do
-    entry="$(trim "$entry")"
-    [ -z "$entry" ] && continue
-
-    if [[ "$entry" != *:* ]]; then
-        echo "Fehler: Eintrag ohne ':' in LT_USERS: '$entry'" >&2
-        echo "Erwartetes Format: benutzer:passwort" >&2
-        exit 1
-    fi
-
-    user="$(trim "${entry%%:*}")"
-    pass="${entry#*:}"          # Passwort NICHT trimmen (Leerzeichen könnten gewollt sein)
-
-    if [ -z "$user" ] || [ -z "$pass" ]; then
-        echo "Fehler: Benutzer oder Passwort ist leer in: '$entry'" >&2
-        exit 1
-    fi
-
-    hash_entry "$user" "$pass" >> "$TMP_HTPASSWD"
-    echo "  + $user"
-    if [ -z "$first_user" ]; then
-        first_user="$user"
-        first_pass="$pass"
-    fi
-    count=$((count + 1))
-done
-
-if [ "$count" -eq 0 ]; then
-    echo "Fehler: Es wurde kein gültiger Benutzer in LT_USERS gefunden." >&2
-    exit 1
-fi
-
-mv "$TMP_HTPASSWD" "$PASSWD_FILE"
-trap - EXIT
-
-# Wichtig: nginx liest die Datei im Container als Worker-Prozess mit dem
-# Benutzer "nginx" (uid/gid 101), NICHT als root. Deshalb muss sie fuer die
-# Gruppe 101 lesbar sein - chmod 600 wuerde zu "Permission denied" (HTTP 500)
-# fuehren. Wir setzen 640 + Gruppe 101; falls die Gruppe hier nicht passt,
-# fallen wir auf 644 zurueck.
-if chgrp 101 "$PASSWD_FILE" 2>/dev/null; then
-    chmod 640 "$PASSWD_FILE"
+if [ -t 0 ]; then
+    echo
+    echo "============================================================"
+    echo " LanguageTool – Setup"
+    echo "============================================================"
+    echo
+    echo "  1) Letzten Link ausgeben (nichts ändern)"
+    echo "  2) Neuen Link erstellen (neuen geheimen Pfad erzeugen)"
+    echo
+    read -rp "  Auswahl [1]: " _menu || _menu=""
+    case "$_menu" in
+        2)
+            write_secret_conf "$(gen_token)"
+            existing_secret="$(read_secret)"
+            echo
+            echo "Neuer geheimer Pfad erzeugt."
+            ;;
+        *)
+            if [ -n "$existing_secret" ]; then
+                echo
+                echo "Letzter Link:"
+                print_link "$existing_secret"
+                exit 0
+            fi
+            echo
+            echo "Es gibt noch keinen Link – es wird ein neuer erstellt."
+            write_secret_conf "$(gen_token)"
+            existing_secret="$(read_secret)"
+            ;;
+    esac
 else
-    chmod 644 "$PASSWD_FILE"
+    # Nicht-interaktiv: vollständiges Setup, vorhandenen Link beibehalten.
+    if [ -z "$existing_secret" ]; then
+        write_secret_conf "$(gen_token)"
+        existing_secret="$(read_secret)"
+    fi
 fi
-echo "Fertig: $PASSWD_FILE ($count Benutzer)"
 
-# ---------- 2b. n-gram-Daten (optional, interaktive Auswahl) ----------
-# Merker: Existiert der Schlüssel LT_NGRAMS in .env, gilt die Frage als
-# beantwortet. Fehlt er, fragen wir; fehlt eine gewünschte Sprache (z. B. nach
-# abgebrochenem Download), fragen wir erneut.
+# Sicherstellen, dass secret.conf existiert (z. B. bei kaputter/fehlender Datei).
+if [ -z "$existing_secret" ]; then
+    write_secret_conf "$(gen_token)"
+    existing_secret="$(read_secret)"
+fi
+
+# ---------- 2. n-gram-Daten (optional, interaktive Auswahl) ----------
+# Merker: Existiert die Zustandsdatei, gilt die Frage als beantwortet. Fehlt sie,
+# fragen wir; fehlt eine gewünschte Sprache (z. B. nach abgebrochenem Download),
+# fragen wir erneut.
 ngrams_key_present=false
-if grep -qE '^[[:space:]]*(export[[:space:]]+)?LT_NGRAMS=' .env; then
+if [ -f "$NGRAM_STATE" ]; then
     ngrams_key_present=true
 fi
 
-current_ngrams="$(normalize_ngram_langs "${LT_NGRAMS:-}")"
+current_ngrams=""
+if [ -f "$NGRAM_STATE" ]; then
+    current_ngrams="$(normalize_ngram_langs "$(cat "$NGRAM_STATE" 2>/dev/null || true)")"
+fi
 
 ngrams_missing=false
 for _l in $(printf '%s' "$current_ngrams" | tr ',' ' '); do
@@ -426,7 +393,7 @@ if [ "$ngrams_key_present" = false ] || [ "$ngrams_missing" = true ]; then
             "") ;;   # leere Eingabe: bisherige Auswahl (Default Keine) behalten
             *) echo "  Ungültige Auswahl – verwende 'Keine'."; current_ngrams="" ;;
         esac
-        save_ngrams_to_env "$current_ngrams"
+        save_ngrams_to_state "$current_ngrams"
     else
         echo
         echo "Hinweis: nicht-interaktive Ausführung – n-gram-Auswahl übersprungen."
@@ -434,38 +401,6 @@ if [ "$ngrams_key_present" = false ] || [ "$ngrams_missing" = true ]; then
 fi
 
 ensure_ngrams "$current_ngrams"
-
-# ---------- 2c. Geheimer Pfad für die Browser-Extension ----------
-# Die Extension kann kein Basic-Auth-Passwort senden. Deshalb gibt es einen
-# zufälligen geheimen Pfad, über den der Server ohne Passwort erreichbar ist.
-LT_SECRET="${LT_SECRET:-}"
-if [ -z "$LT_SECRET" ]; then
-    LT_SECRET="$(gen_token)"
-    set_env_var LT_SECRET "$LT_SECRET"
-    echo "Neuer geheimer Extension-Pfad erzeugt und in .env gespeichert."
-fi
-
-mkdir -p nginx
-SECRET_CONF="nginx/secret.conf"
-{
-    echo "# Automatisch erzeugt von setup.sh aus LT_SECRET – nicht manuell bearbeiten."
-    if [ -n "$LT_SECRET" ]; then
-        cat <<EOF
-location /${LT_SECRET}/ {
-    limit_req zone=lt burst=20 nodelay;
-    proxy_pass http://languagetool:8010/;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-}
-EOF
-    else
-        echo "# (kein Secret-Pfad aktiv)"
-    fi
-} > "$SECRET_CONF"
-chmod 600 "$SECRET_CONF" 2>/dev/null || true
-echo "Geheimer Extension-Pfad: /${LT_SECRET}/"
 
 # ---------- 3. Container starten ----------
 # ngrams-Ordner vor dem Mounten anlegen, damit Docker ihn nicht als root erstellt.
@@ -499,14 +434,27 @@ docker compose ps
 
 echo
 echo "Fertig!"
-if [ -n "${current_ngrams:-}" ]; then
-    echo "n-gram-Daten aktiv: ${current_ngrams}"
+installed_ngrams=""
+missing_ngrams=""
+for _l in $(printf '%s' "${current_ngrams:-}" | tr ',' ' '); do
+    if ngram_installed "$_l"; then
+        installed_ngrams="${installed_ngrams:+$installed_ngrams,}$_l"
+    else
+        missing_ngrams="${missing_ngrams:+$missing_ngrams,}$_l"
+    fi
+done
+if [ -n "$installed_ngrams" ]; then
+    echo "n-gram-Daten installiert: ${installed_ngrams}"
 else
-    echo "n-gram-Daten: keine (optional über ./setup.sh nachholbar)"
+    echo "n-gram-Daten: keine installiert"
+fi
+if [ -n "$missing_ngrams" ]; then
+    echo "Noch nicht installiert: ${missing_ngrams} (siehe Meldungen oben)"
+    echo "  Erneut ./setup.sh ausführen, um den Download nachzuholen."
 fi
 
 echo
 echo "Lokaler Test:"
-echo "  curl -u '$first_user:****' http://localhost:${PUBLIC_PORT:-8082}/v2/languages"
+echo "  curl http://localhost:${PUBLIC_PORT}/${existing_secret}/v2/languages"
 
-print_extension_hint "$first_user" "$first_pass" "${PUBLIC_PORT:-8082}" "${LT_SECRET:-}"
+print_link "$existing_secret"

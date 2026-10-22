@@ -17,7 +17,7 @@ services:
     networks:
       - lan
     # Bewusst KEIN ports-Eintrag:
-    # LanguageTool ist nur über nginx (Basic Auth) erreichbar.
+    # LanguageTool ist nur über nginx (geheimer Pfad) erreichbar.
 
   nginx:
     image: nginx:1.27-alpine
@@ -26,10 +26,11 @@ services:
     depends_on:
       - languagetool
     ports:
-      - "${PUBLIC_PORT:-8082}:8082"   # öffentlicher Port (für Portfreigabe)
+      # Öffentlicher Port – wird von setup.sh gesetzt (PUBLIC_PORT).
+      # Intern lauscht nginx immer auf 8082.
+      - "${PUBLIC_PORT:-8082}:8082"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/.htpasswd:/etc/nginx/.htpasswd:ro
       - ./nginx/secret.conf:/etc/nginx/secret.conf:ro
     networks:
       - lan
