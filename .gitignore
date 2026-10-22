@@ -1,0 +1,25 @@
+# ------------------------------------------------------------
+#  Nicht ins Repo: lokale Geheimnisse & generierte Dateien
+# ------------------------------------------------------------
+
+# .env mit echten Benutzern/Passwörtern und LT_SECRET
+.env
+.env.*
+!.env.example
+
+# Von setup.sh erzeugt (enthält Passwort-Hashes bzw. das Secret)
+nginx/.htpasswd
+nginx/secret.conf
+
+# Zertifikate (HTTPS)
+nginx/certs/
+*.pem
+*.key
+
+# n-gram-Daten: sehr groß (mehrere GB), wird vom Setup geladen
+ngrams/
+
+# Logs und Betriebssystem-Kram
+*.log
+.DS_Store
+Thumbs.db

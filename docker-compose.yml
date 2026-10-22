@@ -6,6 +6,14 @@ services:
     environment:
       Java_Xms: 512m          # Start-Heap
       Java_Xmx: 2g            # Max. Heap – anpassen, wenn der PC wenig RAM hat (z. B. 1g)
+      # n-gram-Daten (optional). Der Ordner /ngrams muss die Sprachordner
+      # (en/, de/, ...) enthalten. Wird vom Setup befüllt; ohne Daten wird
+      # dieser Pfad einfach ignoriert.
+      langtool_languageModel: /ngrams
+    volumes:
+      # Optional heruntergeladene n-gram-Daten (read-only).
+      # Existiert der Ordner nicht, legt Docker ihn leer an.
+      - ./ngrams:/ngrams:ro
     networks:
       - lan
     # Bewusst KEIN ports-Eintrag:
@@ -22,6 +30,7 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/.htpasswd:/etc/nginx/.htpasswd:ro
+      - ./nginx/secret.conf:/etc/nginx/secret.conf:ro
     networks:
       - lan
 
