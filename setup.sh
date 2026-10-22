@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 #
-# Setup für LanguageTool hinter nginx mit geheimem Pfad
-# - erzeugt nginx/secret.conf mit einem zufälligen geheimen Pfad (Hash)
-# - lädt optional n-gram-Daten
-# - startet die Container
-# - gibt den fertigen Link für die Browser-Extension aus
+# Setup for LanguageTool behind nginx with a secret path
+# - creates nginx/secret.conf with a random secret path (hash)
+# - optionally downloads n-gram data
+# - starts containers
+# - outputs the ready-to-use link for the browser extension
 #
-# Es wird KEINE .env-Datei mehr benötigt.
+# No .env file needed.
 #
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# ======================= Konfiguration =======================
-# Öffentlicher Port, unter dem LanguageTool erreichbar ist.
-# Bei Änderung nur hier anpassen. docker-compose.yml übernimmt den Wert
-# automatisch; nginx lauscht intern weiterhin auf 8082.
+# ======================= Configuration =======================
+# Public port where LanguageTool is accessible.
+# Change only here. docker-compose.yml will use this value automatically;
+# nginx still listens internally on 8082.
 PUBLIC_PORT=8082
 # =============================================================
 
@@ -22,22 +22,22 @@ export PUBLIC_PORT
 
 SECRET_CONF="nginx/secret.conf"
 
-# ---------- Hilfsfunktionen ----------
+# ---------- Helper functions ----------
 trim() {
     local s="$1"
-    s="${s#"${s%%[![:space:]]*}"}"   # führende Leerzeichen entfernen
-    s="${s%"${s##*[![:space:]]}"}"   # folgende Leerzeichen entfernen
+    s="${s#"${s%%[![:space:]]*}"}"   # remove leading whitespace
+    s="${s%"${s##*[![:space:]]}"}"   # remove trailing whitespace
     printf '%s' "$s"
 }
 
-# ---------- n-gram-Daten (Language Model, optional) ----------
-# Quellen: feste Download-Dateinamen von https://languagetool.org/download/ngram-data/
+# ---------- n-gram data (Language Model, optional) ----------
+# Sources: fixed download filenames from https://languagetool.org/download/ngram-data/
 NGRAM_BASE_URL="https://languagetool.org/download/ngram-data"
 NGRAM_DIR="ngrams"
-# Merkt sich die Auswahl (z. B. "de,en"). Leere Datei = bewusst "Keine".
+# Stores selection (e.g. "de,en"). Empty file means "None".
 NGRAM_STATE="$NGRAM_DIR/.languages"
 
-# Liefert den ZIP-Dateinamen für eine Sprache oder scheitert bei unbekannter Sprache.
+# Returns the ZIP filename for a language or fails for unknown language.
 ngram_zip() {
     case "$1" in
         de) printf '%s' "ngrams-de-20150819.zip" ;;
@@ -49,19 +49,19 @@ ngram_zip() {
     esac
 }
 
-# Menschenlesbarer Name für die Ausgabe.
+# Human-readable name for output.
 ngram_label() {
     case "$1" in
-        de) printf '%s' "Deutsch" ;;
-        en) printf '%s' "Englisch" ;;
-        fr) printf '%s' "Französisch" ;;
-        es) printf '%s' "Spanisch" ;;
-        nl) printf '%s' "Niederländisch" ;;
+        de) printf '%s' "German" ;;
+        en) printf '%s' "English" ;;
+        fr) printf '%s' "French" ;;
+        es) printf '%s' "Spanish" ;;
+        nl) printf '%s' "Dutch" ;;
         *)  printf '%s' "$1" ;;
     esac
 }
 
-# Normalisiert eine Komma-Liste: trimmt, lowercase, prüft, entdoppelt.
+# Normalizes a comma list: trim, lowercase, validate, deduplicate.
 normalize_ngram_langs() {
     local input="$1" out="" lang
     local IFS=','
@@ -70,7 +70,7 @@ normalize_ngram_langs() {
         lang="$(printf '%s' "$lang" | tr '[:upper:]' '[:lower:]')"
         [ -z "$lang" ] && continue
         if ! ngram_zip "$lang" >/dev/null; then
-            echo "Warnung: unbekannte n-gram-Sprache '$lang' (erlaubt: de,en,fr,es,nl)" >&2
+            echo "Warning: unknown n-gram language '$lang' (allowed: de,en,fr,es,nl)" >&2
             continue
         fi
         case ",$out," in *",$lang,"*) continue ;; esac
@@ -79,14 +79,13 @@ normalize_ngram_langs() {
     printf '%s' "$out"
 }
 
-# Prüft, ob eine Sprache bereits (vollständig) entpackt vorliegt.
+# Checks if a language is already fully extracted.
 ngram_installed() {
     [ -d "$NGRAM_DIR/$1/1grams" ]
 }
 
-# Entpackte Daten aus einem Temp-Verzeichnis nach ngrams/<lang>/ einsortieren.
-# Erkennt sowohl die direkte Struktur (1grams/...) als auch verschachtelte
-# Varianten (z. B. <lang>/1grams oder eine einzelne Unterebene).
+# Moves extracted data from temp dir to ngrams/<lang>/
+# Detects direct structure (1grams/...) or nested variants.
 install_extracted_ngram() {
     local lang="$1" src="$2" cand
     mkdir -p "$NGRAM_DIR/$lang"
@@ -109,13 +108,10 @@ install_extracted_ngram() {
     return 1
 }
 
-# Stellt sicher, dass NGRAM_DIR existiert und vom aktuellen Benutzer beschreibbar
-# ist. Wird VOR dem Start der Container aufgerufen, damit Docker den Ordner nicht
-# selbst (als root) anlegt. Ist er doch root-owned und leer, wird er neu erstellt;
-# wurde er dabei ersetzt, muss der Container neu erstellt werden (NGRAM_DIR_REPLACED).
+# Ensures NGRAM_DIR exists and is writable by current user.
+# Called before starting containers so Docker doesn't create it as root.
 NGRAM_DIR_REPLACED=false
-# Wird gesetzt, wenn tatsächlich neue n-gram-Daten geladen wurden -> Container
-# muss danach neu gestartet werden, damit LanguageTool sie einliest.
+# Set if new n-gram data was downloaded -> container needs to be recreated
 NGRAM_DOWNLOADED=false
 ensure_ngram_dir_ready() {
     local d="$NGRAM_DIR"
@@ -130,13 +126,12 @@ ensure_ngram_dir_ready() {
         NGRAM_DIR_REPLACED=true
         return 0
     fi
-    echo "Warnung: '$d' ist nicht beschreibbar und konnte nicht neu angelegt werden." >&2
-    echo "         Bitte einmalig ausführen:  sudo chown -R \"\$USER\" $d" >&2
+    echo "Warning: '$d' is not writable and could not be recreated." >&2
+    echo "         Run once:  sudo chown -R \"\$USER\" $d" >&2
     return 0
 }
 
-# Entpackt ein ZIP. unzip ist nicht überall vorhanden (z. B. NixOS),
-# deshalb Fallbacks auf bsdtar und python3.
+# Extract ZIP. unzip may not be available; fallback to bsdtar and python3.
 extract_zip() {
     local zip="$1" dest="$2"
     if command -v unzip >/dev/null 2>&1; then
@@ -152,63 +147,63 @@ extract_zip() {
     fi
 }
 
-# Lädt fehlende Sprachen herunter und entpackt sie. Vorhandene werden übersprungen.
+# Downloads missing languages and extracts them. Skips already installed ones.
 ensure_ngrams() {
     local langs="$1"
     [ -z "$langs" ] && return 0
 
     if ! command -v curl >/dev/null 2>&1; then
-        echo "Warnung: 'curl' fehlt – n-gram-Daten werden übersprungen." >&2
+        echo "Warning: 'curl' missing - skipping n-gram data." >&2
         return 0
     fi
     if ! command -v unzip >/dev/null 2>&1 \
         && ! command -v bsdtar >/dev/null 2>&1 \
         && ! command -v python3 >/dev/null 2>&1; then
-        echo "Warnung: kein Entpacker gefunden (unzip, bsdtar oder python3)" >&2
-        echo "         – n-gram-Daten werden übersprungen." >&2
+        echo "Warning: no extractor found (unzip, bsdtar, or python3)" >&2
+        echo "         - skipping n-gram data." >&2
         return 0
     fi
 
     ensure_ngram_dir_ready
     if [ ! -w "$NGRAM_DIR" ]; then
-        echo "Warnung: '$NGRAM_DIR' ist nicht beschreibbar – Download wird übersprungen." >&2
+        echo "Warning: '$NGRAM_DIR' is not writable - skipping download." >&2
         return 0
     fi
 
-    echo "Prüfe n-gram-Daten:"
+    echo "Checking n-gram data:"
     local lang zip url tmp
     local IFS=','
     for lang in $langs; do
         [ -z "$lang" ] && continue
         if ngram_installed "$lang"; then
-            echo "  - $lang ($(ngram_label "$lang")): bereits vorhanden, übersprungen"
+            echo "  - $lang ($(ngram_label "$lang")): already installed, skipping"
             continue
         fi
         zip="$(ngram_zip "$lang")" || continue
         url="$NGRAM_BASE_URL/$zip"
-        echo "  - $lang ($(ngram_label "$lang")): lade $zip (groß, kann dauern) ..."
+        echo "  - $lang ($(ngram_label "$lang")): downloading $zip (large, may take a while) ..."
         tmp="$(mktemp -d)"
         if ! curl -fL --retry 3 -o "$tmp/$zip" "$url"; then
-            echo "    Fehler: Download fehlgeschlagen – $lang wird übersprungen." >&2
+            echo "    Error: download failed - skipping $lang." >&2
             rm -rf "$tmp"
             continue
         fi
         if ! extract_zip "$tmp/$zip" "$tmp/x"; then
-            echo "    Fehler: Entpacken fehlgeschlagen – $lang wird übersprungen." >&2
+            echo "    Error: extraction failed - skipping $lang." >&2
             rm -rf "$tmp"
             continue
         fi
         if install_extracted_ngram "$lang" "$tmp/x"; then
-            echo "    Fertig: $lang in $NGRAM_DIR/$lang/"
+            echo "    Done: $lang in $NGRAM_DIR/$lang/"
             NGRAM_DOWNLOADED=true
         else
-            echo "    Fehler: unerwartete ZIP-Struktur – $lang wird übersprungen." >&2
+            echo "    Error: unexpected ZIP structure - skipping $lang." >&2
         fi
         rm -rf "$tmp"
     done
 }
 
-# Erzeugt ein zufälliges Token (für den geheimen Extension-Pfad).
+# Generates a random token (for the secret extension path).
 gen_token() {
     if command -v openssl >/dev/null 2>&1; then
         openssl rand -hex 16
@@ -217,27 +212,27 @@ gen_token() {
     fi
 }
 
-# Speichert die n-gram-Auswahl (ohne .env).
+# Saves n-gram selection.
 save_ngrams_to_state() {
     mkdir -p "$NGRAM_DIR"
     printf '%s\n' "$1" > "$NGRAM_STATE"
-    echo "  (Auswahl gespeichert${1:+, aktuell: $1})"
+    echo "  (Selection saved${1:+, current: $1})"
 }
 
-# ---------- Geheimer Pfad (Hash) ----------
-# Liest den aktuell verwendeten geheimen Pfad aus nginx/secret.conf.
+# ---------- Secret path (hash) ----------
+# Reads the currently used secret path from nginx/secret.conf.
 read_secret() {
     [ -f "$SECRET_CONF" ] || return 0
     sed -n 's|^location /\([^/]*\)/ {|\1|p' "$SECRET_CONF" | head -n1
 }
 
-# Schreibt nginx/secret.conf mit dem übergebenen geheimen Pfad.
+# Writes nginx/secret.conf with the given secret path.
 write_secret_conf() {
     local secret="$1"
     mkdir -p nginx
     cat > "$SECRET_CONF" <<EOF
-# Automatisch erzeugt von setup.sh – nicht manuell bearbeiten.
-# LanguageTool ist ausschließlich über diesen geheimen Pfad erreichbar.
+# Automatically generated by setup.sh - do not edit manually.
+# LanguageTool is only accessible via this secret path.
 location /${secret}/ {
     limit_req zone=lt burst=20 nodelay;
     proxy_pass http://languagetool:8010/;
@@ -250,8 +245,8 @@ EOF
     chmod 600 "$SECRET_CONF" 2>/dev/null || true
 }
 
-# ---------- Server-Adresse für die LanguageTool-Extension ----------
-# Ermittelt die lokale LAN-IP (leer, wenn nicht ermittelbar).
+# ---------- Server address for LanguageTool extension ----------
+# Detects local LAN IP (empty if not found).
 detect_lan_ip() {
     local ip=""
     if command -v ip >/dev/null 2>&1; then
@@ -263,7 +258,7 @@ detect_lan_ip() {
     printf '%s' "$ip"
 }
 
-# Ermittelt die öffentliche IP (leer, wenn offline/nicht ermittelbar).
+# Detects public IP (empty if offline/not found).
 detect_public_ip() {
     local ip=""
     if command -v curl >/dev/null 2>&1; then
@@ -272,7 +267,7 @@ detect_public_ip() {
     printf '%s' "$ip"
 }
 
-# Gibt den fertigen Link für die Extension aus.
+# Prints the ready-to-use URL for the extension.
 print_link() {
     local secret="$1"
     local lan_ip pub_ip
@@ -281,77 +276,73 @@ print_link() {
 
     echo
     echo "============================================================"
-    echo " LanguageTool-Adresse für die Browser-Extension"
+    echo " LanguageTool URL for the Browser Extension"
     echo "============================================================"
     echo
-    echo "Diese URL im Feld 'Server-URL' bzw. 'LanguageTool API Server URL'"
-    echo "eintragen ('/v2' am Ende gehört dazu):"
+    echo "Add this URL to 'LanguageTool API Server URL' (include '/v2' at the end):"
     echo
-    echo "  auf diesem PC:      http://localhost:${PUBLIC_PORT}/${secret}/v2"
+    echo "  On this PC:        http://localhost:${PUBLIC_PORT}/${secret}/v2"
     if [ -n "$lan_ip" ]; then
-        echo "  im Heimnetz (LAN):  http://${lan_ip}:${PUBLIC_PORT}/${secret}/v2"
+        echo "  On LAN:            http://${lan_ip}:${PUBLIC_PORT}/${secret}/v2"
     fi
     if [ -n "$pub_ip" ]; then
-        echo "  aus dem Internet:   http://${pub_ip}:${PUBLIC_PORT}/${secret}/v2"
+        echo "  From Internet:     http://${pub_ip}:${PUBLIC_PORT}/${secret}/v2"
     else
-        echo "  aus dem Internet:   http://DEINE-DDNS-ODER-IP:${PUBLIC_PORT}/${secret}/v2"
+        echo "  From Internet:     http://YOUR-DDNS-OR-IP:${PUBLIC_PORT}/${secret}/v2"
     fi
     echo
-    echo "  Der geheime Pfad ist wie ein Passwort: nicht weitergeben."
-    echo "  Ein neuer Link lässt sich jederzeit mit ./setup.sh erzeugen."
+    echo "  The secret path is like a password - keep it safe."
+    echo "  You can generate a new link anytime with ./setup.sh."
 }
 
-# ---------- 1. Menü: letzten Link ausgeben oder neuen erstellen ----------
+# ---------- 1. Menu: show last link or create new one ----------
 existing_secret="$(read_secret)"
 
 if [ -t 0 ]; then
     echo
     echo "============================================================"
-    echo " LanguageTool – Setup"
+    echo " LanguageTool - Setup"
     echo "============================================================"
     echo
-    echo "  1) Letzten Link ausgeben (nichts ändern)"
-    echo "  2) Neuen Link erstellen (neuen geheimen Pfad erzeugen)"
+    echo "  1) Show last link (no changes)"
+    echo "  2) Create new link (generate new secret path)"
     echo
-    read -rp "  Auswahl [1]: " _menu || _menu=""
+    read -rp "  Choice [1]: " _menu || _menu=""
     case "$_menu" in
         2)
             write_secret_conf "$(gen_token)"
             existing_secret="$(read_secret)"
             echo
-            echo "Neuer geheimer Pfad erzeugt."
+            echo "New secret path generated."
             ;;
         *)
             if [ -n "$existing_secret" ]; then
                 echo
-                echo "Letzter Link:"
+                echo "Last link:"
                 print_link "$existing_secret"
                 exit 0
             fi
             echo
-            echo "Es gibt noch keinen Link – es wird ein neuer erstellt."
+            echo "No link found - creating a new one."
             write_secret_conf "$(gen_token)"
             existing_secret="$(read_secret)"
             ;;
     esac
 else
-    # Nicht-interaktiv: vollständiges Setup, vorhandenen Link beibehalten.
+    # Non-interactive: full setup, keep existing link if present.
     if [ -z "$existing_secret" ]; then
         write_secret_conf "$(gen_token)"
         existing_secret="$(read_secret)"
     fi
 fi
 
-# Sicherstellen, dass secret.conf existiert (z. B. bei kaputter/fehlender Datei).
+# Ensure secret.conf exists.
 if [ -z "$existing_secret" ]; then
     write_secret_conf "$(gen_token)"
     existing_secret="$(read_secret)"
 fi
 
-# ---------- 2. n-gram-Daten (optional, interaktive Auswahl) ----------
-# Merker: Existiert die Zustandsdatei, gilt die Frage als beantwortet. Fehlt sie,
-# fragen wir; fehlt eine gewünschte Sprache (z. B. nach abgebrochenem Download),
-# fragen wir erneut.
+# ---------- 2. n-gram data (optional, interactive selection) ----------
 ngrams_key_present=false
 if [ -f "$NGRAM_STATE" ]; then
     ngrams_key_present=true
@@ -370,60 +361,57 @@ done
 if [ "$ngrams_key_present" = false ] || [ "$ngrams_missing" = true ]; then
     if [ -t 0 ]; then
         echo
-        echo "── n-gram-Daten (optional) ─────────────────────────────"
-        echo "  Verbessert die Erkennung verwechselter Wörter"
-        echo "  (z. B. das/dass, their/there). Großer Download, nur einmalig."
+        echo "── n-gram data (optional) ─────────────────────────────"
+        echo "  Improves detection of commonly confused words"
+        echo "  (e.g. their/there). Large download, one-time."
         echo
-        echo "  1) Keine"
-        echo "  2) Nur Deutsch              (1,7 GB)"
-        echo "  3) Deutsch + Englisch       (~11 GB)"
-        echo "  4) Eigene Auswahl           (de,en,fr,es,nl)"
+        echo "  1) None"
+        echo "  2) German only              (1.7 GB)"
+        echo "  3) German + English         (~11 GB)"
+        echo "  4) Custom selection         (de,en,fr,es,nl)"
         if [ -n "$current_ngrams" ]; then
-            echo "  (bisher gewählt: $current_ngrams)"
+            echo "  (currently selected: $current_ngrams)"
         fi
-        read -rp "  Auswahl [1]: " _choice || _choice=""
+        read -rp "  Choice [1]: " _choice || _choice=""
         case "$_choice" in
             2) current_ngrams="de" ;;
             3) current_ngrams="de,en" ;;
             4)
-                read -rp "  Sprachen (Komma-getrennt, z. B. de,en): " _custom || _custom=""
+                read -rp "  Languages (comma-separated, e.g. de,en): " _custom || _custom=""
                 current_ngrams="$(normalize_ngram_langs "$_custom")"
                 ;;
             1) current_ngrams="" ;;
-            "") ;;   # leere Eingabe: bisherige Auswahl (Default Keine) behalten
-            *) echo "  Ungültige Auswahl – verwende 'Keine'."; current_ngrams="" ;;
+            "") ;;   # keep previous/default (None)
+            *) echo "  Invalid choice - using 'None'."; current_ngrams="" ;;
         esac
         save_ngrams_to_state "$current_ngrams"
     else
         echo
-        echo "Hinweis: nicht-interaktive Ausführung – n-gram-Auswahl übersprungen."
+        echo "Note: non-interactive run - skipping n-gram selection."
     fi
 fi
 
 ensure_ngrams "$current_ngrams"
 
-# ---------- 3. Container starten ----------
-# ngrams-Ordner vor dem Mounten anlegen, damit Docker ihn nicht als root erstellt.
+# ---------- 3. Start containers ----------
 ensure_ngram_dir_ready
 
 echo
-echo "Starte Container ... (erster Start lädt die Images, kann dauern)"
+echo "Starting containers ... (first start may take a while to pull images)"
 if [ "$NGRAM_DIR_REPLACED" = true ] || [ "$NGRAM_DOWNLOADED" = true ]; then
-    # Neuer ngrams-Ordner und/oder neue Daten -> Container neu erstellen, damit
-    # der Mount stimmt und LanguageTool die n-gram-Daten beim Start einliest.
     docker compose up -d --force-recreate languagetool
 else
     docker compose up -d
 fi
 
-# nginx-Konfiguration testen und neu laden (falls nginx schon läuft)
+# Test and reload nginx if running
 if docker compose ps 2>/dev/null | grep -q "languagetool-nginx"; then
-    echo "Prüfe nginx-Konfiguration ..."
+    echo "Testing nginx configuration ..."
     if docker compose exec -T nginx nginx -t >/dev/null 2>&1; then
         docker compose exec -T nginx nginx -s reload >/dev/null 2>&1 \
-            && echo "nginx-Konfiguration neu geladen."
+            && echo "nginx configuration reloaded."
     else
-        echo "WARNUNG: nginx-Konfiguration ungültig – die alte bleibt aktiv." >&2
+        echo "WARNING: nginx configuration invalid - keeping old config." >&2
         docker compose exec -T nginx nginx -t || true
     fi
 fi
@@ -433,7 +421,7 @@ echo "Status:"
 docker compose ps
 
 echo
-echo "Fertig!"
+echo "Done!"
 installed_ngrams=""
 missing_ngrams=""
 for _l in $(printf '%s' "${current_ngrams:-}" | tr ',' ' '); do
@@ -444,17 +432,17 @@ for _l in $(printf '%s' "${current_ngrams:-}" | tr ',' ' '); do
     fi
 done
 if [ -n "$installed_ngrams" ]; then
-    echo "n-gram-Daten installiert: ${installed_ngrams}"
+    echo "n-gram data installed: ${installed_ngrams}"
 else
-    echo "n-gram-Daten: keine installiert"
+    echo "n-gram data: none installed"
 fi
 if [ -n "$missing_ngrams" ]; then
-    echo "Noch nicht installiert: ${missing_ngrams} (siehe Meldungen oben)"
-    echo "  Erneut ./setup.sh ausführen, um den Download nachzuholen."
+    echo "Not yet installed: ${missing_ngrams} (see messages above)"
+    echo "  Run ./setup.sh again to retry the download."
 fi
 
 echo
-echo "Lokaler Test:"
+echo "Local test:"
 echo "  curl http://localhost:${PUBLIC_PORT}/${existing_secret}/v2/languages"
 
 print_link "$existing_secret"

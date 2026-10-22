@@ -4,20 +4,19 @@ services:
     container_name: languagetool
     restart: unless-stopped
     environment:
-      Java_Xms: 512m          # Start-Heap
-      Java_Xmx: 2g            # Max. Heap – anpassen, wenn der PC wenig RAM hat (z. B. 1g)
-      # n-gram-Daten (optional). Der Ordner /ngrams muss die Sprachordner
-      # (en/, de/, ...) enthalten. Wird vom Setup befüllt; ohne Daten wird
-      # dieser Pfad einfach ignoriert.
+      Java_Xms: 512m # Initial heap
+      Java_Xmx: 2g # Max heap - adjust if your PC has limited RAM (e.g. 1g)
+      # n-gram data (optional). The /ngrams folder must contain language subfolders
+      # (de/, en/, ...). Populated by setup.sh; if empty, this is ignored.
       langtool_languageModel: /ngrams
     volumes:
-      # Optional heruntergeladene n-gram-Daten (read-only).
-      # Existiert der Ordner nicht, legt Docker ihn leer an.
+      # Optional downloaded n-gram data (read-only).
+      # If the folder doesn't exist, Docker will create it empty.
       - ./ngrams:/ngrams:ro
     networks:
       - lan
-    # Bewusst KEIN ports-Eintrag:
-    # LanguageTool ist nur über nginx (geheimer Pfad) erreichbar.
+    # No ports exposed directly:
+    # LanguageTool is only accessible via nginx with the secret path.
 
   nginx:
     image: nginx:1.27-alpine
@@ -26,8 +25,8 @@ services:
     depends_on:
       - languagetool
     ports:
-      # Öffentlicher Port – wird von setup.sh gesetzt (PUBLIC_PORT).
-      # Intern lauscht nginx immer auf 8082.
+      # Public port - set by setup.sh (PUBLIC_PORT).
+      # Internally nginx always listens on 8082.
       - "${PUBLIC_PORT:-8082}:8082"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
